@@ -1,0 +1,22 @@
+# DnsChecker 工作空间根配置 (Virtual Workspace)
+# 根目录仅负责统一管理 core 与 app 两个 crate 的依赖版本与构建，
+# 本身不作为可编译的 package，保持职责单一 (KISS 原则)
+
+[workspace]
+members = ["core", "app"]
+resolver = "2"
+
+# 工作空间共享的元信息，子 crate 通过 `field.workspace = true` 引用
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["VoidCat"]
+license = "MPL-2.0"
+description = "A DNS checker tool written in Rust"
+publish = false
+
+# 工作空间共享的依赖版本声明，子 crate 通过 `dep.workspace = true` 引用
+# 这样可保证版本一致性，集中管理依赖 (DRY 原则)
+[workspace.dependencies]
+# 此处预留共享依赖，按需添加，例如：
+# tokio = { version = "1", features = ["full"] }

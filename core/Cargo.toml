@@ -1,0 +1,12 @@
+[package]
+name = "dns-checker-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core DNS checking library for DnsChecker"
+publish.workspace = true
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# 核心库依赖按需在此添加

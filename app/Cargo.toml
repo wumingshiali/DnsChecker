@@ -1,0 +1,18 @@
+[package]
+name = "dns-checker-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DNS checker command-line application"
+publish.workspace = true
+
+[[bin]]
+name = "dns-checker"
+path = "src/main.rs"
+
+[dependencies]
+dns-checker-core = { path = "../core" }
+eframe = "0.35.0"
+egui = "0.35.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
