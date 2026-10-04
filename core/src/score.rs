@@ -27,31 +27,40 @@ impl Encryption {
 
 /// 计算综合评分。
 ///
-/// 公式: `score = (80 - dns_latency) * (100 - resolve_quality) * encryption * recommendation`
+/// 公式: `score = ((80 - dns_latency) / 2.0) * ((100 - resolve_latency) / 1.5) * encryption * recommendation`
 ///
-/// 当某个减法项为负（延迟超过基准）时，该项钳为 `5`：避免负数项导致分数
-/// 符号异常或被错误地放大，以小正值表示「延迟超标但仍参与评分」。
+/// 当某个减法项为负（延迟超过基准）时，该项钳为极小值 `0.1`：避免负数项导致分数
+/// 符号异常，同时保留微小分值表示「延迟超标但仍参与评分」。
 ///
 /// # 参数
 ///
-/// - `dns_latency`: DNS 服务器 ping 延迟（毫秒）。越小越好，80ms 为基准；超过 80ms 该项取 5。
-/// - `resolve_quality`: 解析质量指标。**越小越好**（如解析后 ping 的平均延迟），100 为基准；超过 100 该项取 5。
-///   注意：公式为 `100 - resolve_quality`，故传入「越小越好」的量（延迟/错误数等）才会得高分。
-/// - `encryption`: 加密支持等级（[`Encryption`]），系数 0.5 / 0.75 / 1.0。
-/// - `recommendation`: 推荐系数，推荐范围 `[0.5, 1.0]`。函数不做范围校验，由调用者保证。
+/// - `dns_latency`: DNS 服务器 ping 延迟（毫秒）。越小越好，80ms 为基准。
+/// - `resolve_latency`: 解析后 ping 的平均延迟（毫秒）。越小越好，100ms 为基准。
+/// - `encryption`: 加密支持等级，系数 0.5 / 0.75 / 1.0。
+/// - `recommendation`: 推荐系数，推荐范围 `[0.5, 1.0]`。
 ///
 /// # 返回
 ///
-/// 最终分数，越大越好。
+/// 最终分数，越大越好。若输入包含 NaN 则返回 0.0。
 pub fn compute_score(
     dns_latency: f64,
-    resolve_quality: f64,
+    resolve_latency: f64,
     encryption: Encryption,
     recommendation: f64,
 ) -> f64 {
-    let latency_term = nonneg_or((80.0 - dns_latency) / 2.0, 5.0);
-    let quality_term = nonneg_or((100.0 - resolve_quality) / 1.5, 5.0);
-    latency_term * quality_term * encryption.factor() * recommendation
+    // 安全防御：拦截 NaN 和 Infinity，防止污染下游计算
+    if [dns_latency, resolve_latency, recommendation].iter().any(|&x| !x.is_finite()) {
+        return 0.0; 
+    }
+
+    // 使用 f64::max 确保不会出现负数，0.1 作为保底极小值（请根据实际业务确认此值）
+    let latency_term = ((80.0 - dns_latency) / 2.0).max(0.1);
+    let quality_term = ((100.0 - resolve_latency) / 1.5).max(0.1);
+
+    let score = latency_term * quality_term * encryption.factor() * recommendation;
+    
+    // 最终兜底，确保输出绝对合法
+    if score.is_finite() { score } else { 0.0 }
 }
 
 /// 若 `value` 为负则替换为 `fallback`，否则保持原值。
