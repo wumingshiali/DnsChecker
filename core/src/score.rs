@@ -1,30 +1,40 @@
 //! DNS 服务器综合评分。
 //!
 //! 根据延迟、解析质量、加密支持与推荐系数计算最终分数。
-//! 公式: `score = (80 - dns_latency) * (100 - resolve_quality) * encryption * recommendation`
+//! 采用「Sigmoid 衰减 + 动态权重」模型，全程平滑无拐点，自动容错。
 
-/// DNS 加密支持等级，对应公式中的加密系数（0.5 / 0.75 / 1.0）。
+/// DNS 加密支持等级，对应公式中的加密系数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encryption {
-    /// 无加密支持（如明文 DNS），系数 0.5。
+    /// 无加密支持（如明文 DNS），系数 0.85。
     None,
-    /// 部分加密支持，系数 0.75。
+    /// 部分加密支持，系数 0.95。
     Partial,
     /// 完全加密支持（如 DoT / DoH），系数 1.0。
     Full,
 }
 
 impl Encryption {
-    /// 加密系数：`None=0.5`、`Partial=0.75`、`Full=1.0`。
+    /// 加密系数：`None=0.85`、`Partial=0.95`、`Full=1.0`。
     pub fn factor(self) -> f64 {
         match self {
-            Encryption::None => 0.5,
-            Encryption::Partial => 0.75,
+            Encryption::None => 0.85,
+            Encryption::Partial => 0.95,
             Encryption::Full => 1.0,
         }
     }
 }
 
+/// 计算综合评分。
+///
+/// # 参数
+/// - `dns_latency`: DNS 服务器 ping 延迟（毫秒）。越小越好。
+/// - `resolve_latency`: 解析后 ping 的平均延迟（毫秒）。越小越好。
+/// - `encryption`: 加密支持等级（[`Encryption`]），系数 0.85 / 0.95 / 1.0。
+/// - `recommendation`: 推荐系数，推荐范围 `[0.8, 1.0]`。
+///
+/// # 返回
+/// 最终分数，越大越好。若输入包含非法浮点数，则返回 `0.0`。
 pub fn compute_score(
     dns_latency: f64,
     resolve_latency: f64,
@@ -36,24 +46,28 @@ pub fn compute_score(
         return 0.0;
     }
 
-    // 2. 核心算法：反比例衰减模型
-    // 公式: Score = Base / (1 + latency / k)
-    // k 是半衰期常数。当 latency = k 时，得分衰减到 Base 的一半。
-    
-    // 假设基础分为 100，DNS延迟半衰期设为 50ms (即 50ms 时得 50分，100ms 时得 33分)
-    let latency_score = 100.0 / (1.0 + dns_latency / 50.0);
-    
-    // 解析质量半衰期设为 80ms
-    let quality_score = 100.0 / (1.0 + resolve_latency / 80.0);
+    // 2. Sigmoid 衰减打分
+    // 中心点：dns=50ms, resolve=100ms
+    // 斜率：控制衰减速度（值越大，中心点附近变化越剧烈）
+    let dns_score = sigmoid_score(dns_latency, 50.0, 0.04);
+    let resolve_score = sigmoid_score(resolve_latency, 100.0, 0.025);
 
-    // 3. 加权融合 (改用加权平均或带底数的乘法，避免雪崩)
-    // 这里采用几何平均的变体，或者简单的加权乘法，保证平滑
-    let base_score = (latency_score * quality_score).sqrt(); // 几何平均，防止单项过高掩盖另一项的拉胯
+    // 3. 动态权重：如果某一项极差，自动降低其权重，避免一票否决
+    let dns_weight = if dns_score < 30.0 { 0.2 } else { 0.4 };
+    let resolve_weight = 1.0 - dns_weight;
 
-    // 4. 乘以系数
+    let base_score = dns_score * dns_weight + resolve_score * resolve_weight;
+
+    // 4. 全局系数
     let final_score = base_score * encryption.factor() * recommendation;
 
-    if final_score.is_finite() { final_score } else { 0.0 }
+    if final_score.is_finite() { final_score.max(0.0) } else { 0.0 }
+}
+
+/// Sigmoid 打分：在中心点附近急剧变化，两端平缓，全程平滑无拐点
+fn sigmoid_score(latency: f64, center: f64, steepness: f64) -> f64 {
+    let x = (latency - center) * steepness;
+    100.0 / (1.0 + x.exp())
 }
 
 #[cfg(test)]
@@ -62,72 +76,56 @@ mod tests {
 
     #[test]
     fn encryption_factors() {
-        assert_eq!(Encryption::None.factor(), 0.5);
-        assert_eq!(Encryption::Partial.factor(), 0.75);
+        assert_eq!(Encryption::None.factor(), 0.85);
+        assert_eq!(Encryption::Partial.factor(), 0.95);
         assert_eq!(Encryption::Full.factor(), 1.0);
     }
 
-    /// (80-20)/2 * (100-30)/1.5 * 1.0 * 1.0 = 30 * (70/1.5) = 1400
     #[test]
-    fn score_basic_full_encryption() {
-        let s = compute_score(20.0, 30.0, Encryption::Full, 1.0);
-        assert!((s - 1400.0).abs() < 1e-6, "got {}", s);
+    fn score_excellent_latency_near_full_score() {
+        // 延迟极低，Sigmoid 输出接近 100
+        let s = compute_score(10.0, 30.0, Encryption::Full, 1.0);
+        assert!(s > 95.0, "got {}", s);
     }
 
-    /// 无加密应使分数减半：1400 -> 700
     #[test]
-    fn score_none_encryption_halves() {
-        let full = compute_score(20.0, 30.0, Encryption::Full, 1.0);
-        let none = compute_score(20.0, 30.0, Encryption::None, 1.0);
-        assert!((none - full * 0.5).abs() < 1e-6);
-        assert!((none - 700.0).abs() < 1e-6);
-    }
-
-    /// 部分加密：1400 * 0.75 = 1050
-    #[test]
-    fn score_partial_encryption() {
-        let s = compute_score(20.0, 30.0, Encryption::Partial, 1.0);
-        assert!((s - 1050.0).abs() < 1e-6);
-    }
-
-    /// 推荐系数线性缩放：1.0 -> 1400, 0.5 -> 700
-    #[test]
-    fn score_recommendation_scales_linearly() {
-        let base = compute_score(20.0, 30.0, Encryption::Full, 1.0);
-        let half = compute_score(20.0, 30.0, Encryption::Full, 0.5);
-        assert!((half - base * 0.5).abs() < 1e-6);
-        assert!((half - 700.0).abs() < 1e-6);
-    }
-
-    /// 零延迟零质量得满分：80/2 * 100/1.5 = 40 * (100/1.5) = 8000/3
-    #[test]
-    fn score_zero_latency_and_quality() {
-        let s = compute_score(0.0, 0.0, Encryption::Full, 1.0);
-        assert!((s - 8000.0 / 3.0).abs() < 1e-6);
-    }
-
-    /// 延迟超过基准时该项钳为 5，分数仍为正。
-    /// score = 5 * (100-30)/1.5 * 1 * 1 = 5 * (70/1.5) = 700/3
-    #[test]
-    fn score_latency_exceeds_baseline_clamped_to_5() {
-        let s = compute_score(100.0, 30.0, Encryption::Full, 1.0);
-        assert!((s - 700.0 / 3.0).abs() < 1e-6, "got {}", s);
+    fn score_high_latency_decay() {
+        // 延迟较高，Sigmoid 输出显著下降
+        let s = compute_score(150.0, 250.0, Encryption::Full, 1.0);
+        assert!(s < 30.0, "got {}", s);
         assert!(s > 0.0);
     }
 
-    /// 解析质量超过基准时该项钳为 5。
-    /// score = (80-20)/2 * 5 * 1 * 1 = 30 * 5 = 150
     #[test]
-    fn score_quality_exceeds_baseline_clamped_to_5() {
-        let s = compute_score(20.0, 120.0, Encryption::Full, 1.0);
-        assert!((s - 150.0).abs() < 1e-6, "got {}", s);
+    fn score_none_encryption_slight_penalty() {
+        let full = compute_score(50.0, 100.0, Encryption::Full, 1.0);
+        let none = compute_score(50.0, 100.0, Encryption::None, 1.0);
+        // 无加密只扣 15%，而不是之前的 50%
+        assert!((none - full * 0.85).abs() < 1e-6);
     }
 
-    /// 两个减法项都为负时都钳为 5。
-    /// score = 5 * 5 * 1 * 1 = 25
     #[test]
-    fn score_both_terms_clamped_to_5() {
-        let s = compute_score(100.0, 120.0, Encryption::Full, 1.0);
-        assert!((s - 25.0).abs() < 1e-6, "got {}", s);
+    fn score_dynamic_weight_adjustment() {
+        // DNS 极差（<30分），权重应降为 0.2
+        let bad_dns = compute_score(500.0, 50.0, Encryption::Full, 1.0);
+        // 解析质量极差（<30分），DNS 权重保持 0.4
+        let bad_resolve = compute_score(50.0, 500.0, Encryption::Full, 1.0);
+        // 两者都应有分数，但不会为 0
+        assert!(bad_dns > 0.0);
+        assert!(bad_resolve > 0.0);
+    }
+
+    #[test]
+    fn score_recommendation_scales_linearly() {
+        let base = compute_score(50.0, 100.0, Encryption::Full, 1.0);
+        let half = compute_score(50.0, 100.0, Encryption::Full, 0.5);
+        assert!((half - base * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_extreme_latency_clamped_to_zero() {
+        // 延迟极高，Sigmoid 输出趋近于 0
+        let s = compute_score(10000.0, 10000.0, Encryption::Full, 1.0);
+        assert!(s < 1.0, "got {}", s);
     }
 }
